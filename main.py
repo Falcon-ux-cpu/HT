@@ -4,6 +4,7 @@ import json
 import smtplib
 import tempfile
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -62,51 +63,45 @@ def optimize_image(input_path, output_path):
         return False
 
 
-def process_and_download_images(soup_content, temp_dir):
-    """
-    Скачивает все картинки статьи на диск Runner'а,
-    оптимизирует их и подменяет src на cid:image_X
-    """
-    inline_images = []
-    
-    for idx, img in enumerate(soup_content.find_all("img")):
-        src = img.get("src") or img.get("data-src")
-        if not src:
-            continue
-        
-        if not src.startswith("http"):
-            src = urllib.parse.urljoin("https://www.hronikatm.com", src)
+def process_single_image(img_tag, idx, temp_dir):
+    """Скачивает и оптимизирует одну картинку, возвращает tuple (cid, path) или None."""
+    src = img_tag.get("src") or img_tag.get("data-src")
+    if not src:
+        return None
 
-        try:
-            raw_path = os.path.join(temp_dir, f"raw_img_{idx}")
-            opt_path = os.path.join(temp_dir, f"opt_img_{idx}.jpg")
+    if not src.startswith("http"):
+        src = urllib.parse.urljoin("https://www.hronikatm.com", src)
 
-            res = requests.get(src, headers=HEADERS, timeout=15)
-            if res.status_code == 200:
-                with open(raw_path, "wb") as f:
-                    f.write(res.content)
+    try:
+        raw_path = os.path.join(temp_dir, f"raw_img_{idx}")
+        opt_path = os.path.join(temp_dir, f"opt_img_{idx}.jpg")
 
-                if optimize_image(raw_path, opt_path):
-                    cid = f"image_{idx}"
-                    img["src"] = f"cid:{cid}"
-                    if "srcset" in img.attrs:
-                        del img["srcset"]
-                    if "sizes" in img.attrs:
-                        del img["sizes"]
+        res = requests.get(src, headers=HEADERS, timeout=15)
+        if res.status_code == 200:
+            with open(raw_path, "wb") as f:
+                f.write(res.content)
 
-                    inline_images.append((cid, opt_path))
-                    print(f"[✓] Картинка скачана и привязана как {cid}")
-                
+            if optimize_image(raw_path, opt_path):
+                cid = f"image_{idx}"
+                img_tag["src"] = f"cid:{cid}"
+                for attr in ["srcset", "sizes", "style"]:
+                    if attr in img_tag.attrs:
+                        del img_tag[attr]
+
                 if os.path.exists(raw_path):
                     os.remove(raw_path)
-        except Exception as e:
-            print(f"[!] Ошибка скачивания фото {src}: {e}")
+                return cid, opt_path
 
-    return inline_images
+            if os.path.exists(raw_path):
+                os.remove(raw_path)
+    except Exception as e:
+        print(f"[!] Ошибка обработки картинки {src}: {e}")
+
+    return None
 
 
 def download_file_attachments(soup_content, temp_dir):
-    """Скачивает не-карточные вложения (PDF, ZIP, DOCX и т.д.) на runner."""
+    """Скачивает вложения (PDF, ZIP, DOCX и т.д.) из тела статьи."""
     downloaded_files = []
     
     for a in soup_content.find_all("a", href=True):
@@ -126,9 +121,8 @@ def download_file_attachments(soup_content, temp_dir):
                     
                     if 0 < file_size <= MAX_ATTACHMENT_SIZE:
                         downloaded_files.append(local_path)
-                        print(f"[✓] Вложение сохранено локально: {filename} ({file_size} байт)")
+                        print(f"[✓] Вложение сохранено локально: {filename}")
                     else:
-                        print(f"[!] Вложение {filename} пропущено (размер > 25MB: {file_size} байт)")
                         if os.path.exists(local_path):
                             os.remove(local_path)
             except Exception as e:
@@ -137,80 +131,99 @@ def download_file_attachments(soup_content, temp_dir):
     return downloaded_files
 
 
-def clean_article_body(soup_content):
-    """Безопасная очистка статьи от мусорных блоков (важное, навигация, редакция, похожие статьи)."""
-    # 1. Удаляем скрипты, стили, фреймы и рекламные элементы
-    for tag in soup_content.find_all(["script", "style", "iframe", "ins", "form", "button"]):
+def format_pub_date_gmt5(soup, fallback_date):
+    """Извлекает время из тега <time>, конвертирует его в GMT+5 и форматирует строку."""
+    time_tag = soup.find("time", class_="entry-date") or soup.find("time")
+    
+    if time_tag and time_tag.get("datetime"):
+        dt_str = time_tag["datetime"]
+        try:
+            # Парсим ISO-формат времени (например: 2026-08-05T09:53:17+02:00)
+            dt = datetime.fromisoformat(dt_str)
+            target_tz = timezone(timedelta(hours=5))
+            dt_gmt5 = dt.astimezone(target_tz)
+            return dt_gmt5.strftime("%d.%m.%Y, %H:%M (GMT+5)")
+        except Exception as e:
+            print(f"[!] Не удалось распарсить дату {dt_str}: {e}")
+
+    if time_tag and time_tag.get_text().strip():
+        return f"{time_tag.get_text().strip()} (GMT+5)"
+
+    return f"{fallback_date} (GMT+5)" if fallback_date else ""
+
+
+def parse_article_exact_fields(soup, temp_dir):
+    """Извлекает только необходимые блоки: заголовок, дата, главное фото, тело статьи."""
+    inline_images = []
+    image_idx = 0
+
+    # 1. Заголовок
+    h1_tag = soup.find("h1", class_="tdb-title-text") or soup.find("h1")
+    title = h1_tag.get_text().strip() if h1_tag else ""
+
+    # 2. Главное фото
+    main_img_html = ""
+    featured_img = soup.find("img", class_="entry-thumb td-modal-image")
+    if featured_img:
+        res = process_single_image(featured_img, image_idx, temp_dir)
+        if res:
+            cid, path = res
+            inline_images.append((cid, path))
+            main_img_html = f'<div style="margin: 15px 0;"><img src="cid:{cid}" style="max-width: 100%; height: auto; display: block; margin: 0 auto;"></div>'
+            image_idx += 1
+
+    # 3. Контент статьи (только нужный блок)
+    content_div = (
+        soup.find("div", class_="tdb-block-inner td-fix-index") or 
+        soup.find("div", class_="entry-content") or 
+        soup.find("article")
+    )
+    
+    if not content_div:
+        return title, main_img_html, "", [], []
+
+    # Удаляем скрипты и мусор из тела статьи
+    for tag in content_div.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # 2. Удаление блоков по CSS-селекторам навигации, сайдбаров и конкретных id (tdi_146, tdi_147, tdi_164)
-    unwanted_selectors = [
-        "#tdi_146", "#tdi_147", "#tdi_164", ".tdb_module_related",
-        ".recent-posts", ".related-posts", ".popular-posts", ".yarpp-related",
-        ".widget", ".post-publisher", ".entry-meta", ".post-meta", ".share-buttons",
-        ".tags-links", ".cat-links", ".comments-area", "#comments", "#respond",
-        ".nav-links", ".post-navigation", ".navigation", ".nav-previous", ".nav-next",
-        ".post-links", ".post-footer", ".editorial-contact", ".sidebar", "#sidebar"
-    ]
-    for selector in unwanted_selectors:
-        for element in soup_content.select(selector):
-            element.decompose()
+    # Скачиваем вложения из текста статьи
+    file_attachments = download_file_attachments(content_div, temp_dir)
 
-    # 3. Безопасное удаление заголовков и навигационных ссылок с ключевыми словами
-    phrases = [
-        "важное", "предыдущая статья", "следующая статья", 
-        "написать в редакцию", "последние сообщения", "последние события", 
-        "больше по теме", "читайте также", "похожие новости", "рекомендуем"
-    ]
+    # Обрабатываем оставшиеся изображения внутри самой статьи
+    for img in content_div.find_all("img"):
+        res = process_single_image(img, image_idx, temp_dir)
+        if res:
+            cid, path = res
+            inline_images.append((cid, path))
+            image_idx += 1
 
-    # Удаляем конкретные элементы, не затрагивая главные контейнеры
-    for elem in soup_content.find_all(["h2", "h3", "h4", "h5", "h6", "a", "span", "p"]):
-        if elem.name in ["div", "article", "body", "html"]:
-            continue
+    article_body_html = str(content_div)
 
-        text = elem.get_text().strip().lower()
-        if any(phrase in text for phrase in phrases):
-            # Если это заголовок блока (например <h3>Важное</h3>), удаляем его и следующий список/блок
-            if elem.name in ["h2", "h3", "h4", "h5", "h6"]:
-                next_sibling = elem.find_next_sibling()
-                if next_sibling and next_sibling.name in ["ul", "ol", "div"]:
-                    next_sibling.decompose()
-                elem.decompose()
-            # Если это ссылка навигации («Предыдущая статья»), удаляем только саму ссылку
-            elif elem.name in ["a", "span"]:
-                elem.decompose()
-
-    return str(soup_content)
+    return title, main_img_html, article_body_html, inline_images, file_attachments
 
 
 def get_article_data(entry, temp_dir):
     url = entry.link
-    title = entry.title
-    pub_date = entry.get("published", "") or entry.get("updated", "")
+    fallback_title = entry.title
+    fallback_date = entry.get("published", "") or entry.get("updated", "")
 
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Находим блок с контентом
-    content_div = soup.find("div", class_="entry-content") or soup.find("article")
-    if not content_div:
-        return None, [], [], title, pub_date
+    # Получаем точную дату и конвертируем в GMT+5
+    pub_date_str = format_pub_date_gmt5(soup, fallback_date)
 
-    # 1. Скачиваем обычные файлы-вложения (PDF, ZIP и др.)
-    file_attachments = download_file_attachments(content_div, temp_dir)
+    # Парсим строго заголовок, главное фото и блок статьи
+    title, main_img_html, body_html, inline_images, file_attachments = parse_article_exact_fields(soup, temp_dir)
 
-    # 2. Скачиваем все фото на Runner, оптимизируем и подменяем на CID
-    inline_images = process_and_download_images(content_div, temp_dir)
+    final_title = title if title else fallback_title
 
-    # 3. Безопасно чистим HTML статьи
-    cleaned_html = clean_article_body(content_div)
-
-    return cleaned_html, inline_images, file_attachments, title, pub_date
+    return final_title, pub_date_str, main_img_html, body_html, inline_images, file_attachments
 
 
-def send_email(html_body, inline_images, file_attachments, article_title, pub_date):
+def send_email(title, pub_date_str, main_img_html, body_html, inline_images, file_attachments):
     msg_root = MIMEMultipart("related")
     msg_root["From"] = GMAIL_USER
     msg_root["To"] = RECIPIENT_EMAIL
@@ -219,6 +232,7 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
     msg_alternative = MIMEMultipart("alternative")
     msg_root.attach(msg_alternative)
 
+    # Строгая верстка письма: Заголовок -> Дата (GMT+5) -> Титульное фото -> Текст статьи
     full_html = f"""
     <html>
       <head>
@@ -226,23 +240,24 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
         <style>
           body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #111; max-width: 800px; margin: 0 auto; padding: 15px; }}
           h1 {{ font-size: 22px; font-weight: bold; margin-bottom: 5px; color: #000; }}
-          .date {{ font-size: 13px; color: #666; margin-bottom: 20px; }}
-          img {{ max-width: 100%; height: auto; display: block; margin: 15px 0; }}
+          .date {{ font-size: 13px; color: #666; margin-bottom: 15px; }}
+          img {{ max-width: 100%; height: auto; }}
           a {{ color: #0056b3; text-decoration: underline; }}
         </style>
       </head>
       <body>
-        <h1>{article_title}</h1>
-        {f'<div class="date">{pub_date}</div>' if pub_date else ''}
-        <hr style="border: 0; border-top: 1px solid #ccc; margin-bottom: 20px;">
-        {html_body}
+        <h1>{title}</h1>
+        {f'<div class="date">{pub_date_str}</div>' if pub_date_str else ''}
+        {main_img_html}
+        <hr style="border: 0; border-top: 1px solid #ccc; margin: 20px 0;">
+        {body_html}
       </body>
     </html>
     """
 
     msg_alternative.attach(MIMEText(full_html, "html", "utf-8"))
 
-    # Прикрепляем оптимизированные изображения через CID
+    # Прикрепляем картинки (включая главную и те, что в теле статьи) через CID
     for cid, img_path in inline_images:
         try:
             with open(img_path, "rb") as f:
@@ -253,7 +268,7 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
         except Exception as e:
             print(f"[!] Ошибка прикрепления CID-картинки {cid}: {e}")
 
-    # Прикрепляем сторонние файлы
+    # Прикрепляем сторонние файлы-вложения
     for filepath in file_attachments:
         try:
             filename = os.path.basename(filepath)
@@ -292,10 +307,10 @@ def main():
             print(f"\n[+] Обработка статьи: {entry.title} ({url})")
 
             try:
-                html_body, inline_images, file_attachments, title, pub_date = get_article_data(entry, temp_dir)
+                title, pub_date, main_img, body, inline_images, attachments = get_article_data(entry, temp_dir)
 
-                if html_body:
-                    send_email(html_body, inline_images, file_attachments, title, pub_date)
+                if body or main_img:
+                    send_email(title, pub_date, main_img, body, inline_images, attachments)
                     sent_urls.add(url)
                     new_sent_count += 1
                     print(f"[✓] Успешно отправлено письмо с темой 'ХТ': {title}")
