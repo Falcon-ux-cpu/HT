@@ -48,16 +48,13 @@ def optimize_image(input_path, output_path):
     """Сжимает и оптимизирует изображение с помощью Pillow."""
     try:
         with Image.open(input_path) as img:
-            # Конвертируем RGBA/P в RGB если нужно
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             
-            # Изменяем размер, если картинка больше MAX_IMAGE_DIMENSION
             width, height = img.size
             if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
                 img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
             
-            # Сохраняем с понижением качества
             img.save(output_path, "JPEG", optimize=True, quality=80)
             return True
     except Exception as e:
@@ -67,22 +64,20 @@ def optimize_image(input_path, output_path):
 
 def process_and_download_images(soup_content, temp_dir):
     """
-    Скачивает все картинки статьи на диск GitHub Runner'а,
+    Скачивает все картинки статьи на диск Runner'а,
     оптимизирует их и подменяет src на cid:image_X
     """
-    inline_images = []  # Список кортежей: (cid, filepath)
+    inline_images = []
     
     for idx, img in enumerate(soup_content.find_all("img")):
         src = img.get("src") or img.get("data-src")
         if not src:
             continue
         
-        # Разрешаем относительные ссылки
         if not src.startswith("http"):
             src = urllib.parse.urljoin("https://www.hronikatm.com", src)
 
         try:
-            # Скачиваем фото во временный файл
             raw_path = os.path.join(temp_dir, f"raw_img_{idx}")
             opt_path = os.path.join(temp_dir, f"opt_img_{idx}.jpg")
 
@@ -91,19 +86,16 @@ def process_and_download_images(soup_content, temp_dir):
                 with open(raw_path, "wb") as f:
                     f.write(res.content)
 
-                # Оптимизируем
                 if optimize_image(raw_path, opt_path):
                     cid = f"image_{idx}"
-                    # Подменяем атрибут src на CID
                     img["src"] = f"cid:{cid}"
-                    # Удаляем лишние атрибуты srcset и sizes, чтобы письмо не путало источника
                     if "srcset" in img.attrs:
                         del img["srcset"]
                     if "sizes" in img.attrs:
                         del img["sizes"]
 
                     inline_images.append((cid, opt_path))
-                    print(f"[✓] Картинка {src} успешно скачана, оптимизирована и привязана как {cid}")
+                    print(f"[✓] Картинка скачана и привязана как {cid}")
                 
                 if os.path.exists(raw_path):
                     os.remove(raw_path)
@@ -146,30 +138,56 @@ def download_file_attachments(soup_content, temp_dir):
 
 
 def clean_article_body(soup_content):
-    """Оставляет строго текст статьи и картинки, вычищая весь остальной UI."""
-    # 1. Удаляем интерактивные и вспомогательные теги
+    """Удаляет мусорные блоки: Важное, Навигацию, Редакцию, Последние сообщения и т.д."""
+    # 1. Удаляем интерактивные теги
     for tag in soup_content.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # 2. Удаляем блоки похожих новостей, метаданных, соцсетей, тегов и виджетов
+    # 2. Удаление структурных блоков по классам/ID темы сайта
     unwanted_selectors = [
+        # Стандартные блоки сайдбара и футера статьи
         ".recent-posts", ".related-posts", ".popular-posts", ".yarpp-related",
         ".widget", ".post-publisher", ".entry-meta", ".post-meta", ".share-buttons",
         ".tags-links", ".cat-links", ".comments-area", "#comments", "#respond",
-        ".nav-links", ".post-navigation"
+        ".nav-links", ".post-navigation", ".navigation", ".nav-previous", ".nav-next",
+        ".post-links", ".post-footer", ".sidebar", "#sidebar", ".editorial-contact",
+        ".important-posts", ".featured-posts", ".sticky-posts", ".more-posts"
     ]
     for selector in unwanted_selectors:
         for element in soup_content.select(selector):
             element.decompose()
 
-    # 3. Удаляем текстовые блоки вида "Последние события", "Читайте также" и т.п.
-    for header in soup_content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div"]):
-        header_text = header.get_text().strip().lower()
-        if any(phrase in header_text for phrase in ["последние события", "читайте также", "похожие новости", "рекомендуем"]):
-            next_sibling = header.find_next_sibling()
-            if next_sibling and next_sibling.name in ["ul", "ol", "div"]:
-                next_sibling.decompose()
-            header.decompose()
+    # 3. Точечное удаление блоков по ключевым словам и заголовкам
+    phrases_to_remove = [
+        "важное", 
+        "предыдущая статья", 
+        "следующая статья", 
+        "написать в редакцию", 
+        "последние сообщения", 
+        "последние события",
+        "больше по теме", 
+        "читайте также", 
+        "похожие новости", 
+        "рекомендуем",
+        "обратная связь",
+        "связаться с нами"
+    ]
+
+    for element in soup_content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "a"]):
+        text = element.get_text().strip().lower()
+        if any(phrase in text for phrase in phrases_to_remove):
+            # Если это ссылка или параграф с фразой вроде "Предыдущая статья", удаляем элемент целиком
+            if element.name in ["a", "p", "div", "span"]:
+                # Если элемент является заголовком или контейнером блока, проверяем его соседей
+                next_elem = element.find_next_sibling()
+                if next_elem and next_elem.name in ["ul", "ol", "div", "p"]:
+                    next_elem.decompose()
+                element.decompose()
+            elif element.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+                next_elem = element.find_next_sibling()
+                if next_elem and next_elem.name in ["ul", "ol", "div", "p"]:
+                    next_elem.decompose()
+                element.decompose()
 
     return str(soup_content)
 
@@ -195,31 +213,28 @@ def get_article_data(entry, temp_dir):
     # 2. Скачиваем все фото на Runner, оптимизируем и подменяем на CID
     inline_images = process_and_download_images(content_div, temp_dir)
 
-    # 3. Полностью чистим HTML статьи (сохраняя ссылки в словах)
+    # 3. Полностью чистим HTML статьи от навигации и мусорных блоков
     cleaned_html = clean_article_body(content_div)
 
     return cleaned_html, inline_images, file_attachments, title, pub_date
 
 
 def send_email(html_body, inline_images, file_attachments, article_title, pub_date):
-    # Используем multipart/related для правильного отображения картинок с CID
     msg_root = MIMEMultipart("related")
     msg_root["From"] = GMAIL_USER
     msg_root["To"] = RECIPIENT_EMAIL
-    # Тема письма строго ХТ
     msg_root["Subject"] = "ХТ"
 
     msg_alternative = MIMEMultipart("alternative")
     msg_root.attach(msg_alternative)
 
-    # Формируем чистый шаблон: Заголовок + Дата + Очищенное тело статьи
     full_html = f"""
     <html>
       <head>
         <meta charset="utf-8">
         <style>
           body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #111; max-width: 800px; margin: 0 auto; padding: 15px; }}
-          h1 {{ font-size: 20px; font-weight: bold; margin-bottom: 5px; color: #000; }}
+          h1 {{ font-size: 22px; font-weight: bold; margin-bottom: 5px; color: #000; }}
           .date {{ font-size: 13px; color: #666; margin-bottom: 20px; }}
           img {{ max-width: 100%; height: auto; display: block; margin: 15px 0; }}
           a {{ color: #0056b3; text-decoration: underline; }}
@@ -236,7 +251,7 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
 
     msg_alternative.attach(MIMEText(full_html, "html", "utf-8"))
 
-    # Встраиваем скачанные оптимизированные изображения прямо в тело письма
+    # Прикрепляем картинки тела через CID
     for cid, img_path in inline_images:
         try:
             with open(img_path, "rb") as f:
@@ -247,7 +262,7 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
         except Exception as e:
             print(f"[!] Ошибка прикрепления CID-картинки {cid}: {e}")
 
-    # Прикрепляем дополнительные файлы (PDF/ZIP и т.д.)
+    # Прикрепляем сторонние файлы
     for filepath in file_attachments:
         try:
             filename = os.path.basename(filepath)
@@ -260,7 +275,6 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
         except Exception as e:
             print(f"[!] Ошибка упаковки вложения {filepath}: {e}")
 
-    # Отправка по SMTP
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_PASS)
         server.send_message(msg_root)
@@ -278,7 +292,6 @@ def main():
         for entry in reversed(feed.entries):
             url = entry.link
 
-            # Проверка URL статьи
             if not re.search(r"hronikatm\.com/\d{4}/\d{2}/", url):
                 continue
 
