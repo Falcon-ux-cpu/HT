@@ -138,13 +138,14 @@ def download_file_attachments(soup_content, temp_dir):
 
 
 def clean_article_body(soup_content):
-    """Безопасная очистка статьи от мусорных блоков (важное, навигация, редакция)."""
+    """Безопасная очистка статьи от мусорных блоков (важное, навигация, редакция, похожие статьи)."""
     # 1. Удаляем скрипты, стили, фреймы и рекламные элементы
     for tag in soup_content.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # 2. Удаление блоков только по ТОЧНЫМ CSS-селекторам навигации и сайдбаров
+    # 2. Удаление блоков по CSS-селекторам навигации, сайдбаров и конкретных id (tdi_146, tdi_147, tdi_164)
     unwanted_selectors = [
+        "#tdi_146", "#tdi_147", "#tdi_164", ".tdb_module_related",
         ".recent-posts", ".related-posts", ".popular-posts", ".yarpp-related",
         ".widget", ".post-publisher", ".entry-meta", ".post-meta", ".share-buttons",
         ".tags-links", ".cat-links", ".comments-area", "#comments", "#respond",
@@ -162,9 +163,8 @@ def clean_article_body(soup_content):
         "больше по теме", "читайте также", "похожие новости", "рекомендуем"
     ]
 
-    # Удаляем только конкретные элементы (ссылки или мелкие заголовки), не затрагивая контейнеры
+    # Удаляем конкретные элементы, не затрагивая главные контейнеры
     for elem in soup_content.find_all(["h2", "h3", "h4", "h5", "h6", "a", "span", "p"]):
-        # Не удаляем главный контейнер или большие блоки
         if elem.name in ["div", "article", "body", "html"]:
             continue
 
