@@ -152,7 +152,7 @@ def format_pub_date_gmt5(soup, fallback_date):
 
 
 def parse_article_exact_fields(soup, temp_dir):
-    """Извлекает только требуемый блок статьи (<div class="tdb-block-inner td-fix-index">)."""
+    """Точный извлекатель: заголовок, главная картинка и гарантированное тело статьи."""
     inline_images = []
     image_idx = 0
 
@@ -171,38 +171,42 @@ def parse_article_exact_fields(soup, temp_dir):
             main_img_html = f'<div style="margin: 15px 0;"><img src="cid:{cid}" style="max-width: 100%; height: auto; display: block; margin: 0 auto;"></div>'
             image_idx += 1
 
-    # 3. Контент статьи: ищем блок tdb-block-inner td-fix-index, содержащий абзацы статьи
+    # 3. Контент статьи: находим параграфы статьи wp-block-paragraph и берем их родительский блок
     content_div = None
-    candidate_divs = soup.find_all("div", class_=lambda c: c and "tdb-block-inner" in c and "td-fix-index" in c)
+    paragraphs = soup.find_all("p", class_="wp-block-paragraph")
     
-    for div in candidate_divs:
-        if div.find("p"):  # Находим блок, внутри которого действительно есть текст параграфов
-            content_div = div
-            break
+    if paragraphs:
+        # Находим контейнер, который объединяет эти параграфы
+        content_div = paragraphs[0].find_parent("div", class_=lambda c: c and "tdb-block-inner" in c)
+        if not content_div:
+            content_div = paragraphs[0].parent
 
-    # Резервный поиск, если структура класса немного отличается
+    # Резервный поиск, если структура статей изменится
     if not content_div:
         content_div = soup.find("div", class_="entry-content") or soup.find("article")
     
     if not content_div:
         return title, main_img_html, "", [], []
 
-    # Очищаем только от скриптов, стилей и фреймов
-    for tag in content_div.find_all(["script", "style", "iframe", "ins", "form", "button"]):
+    # Создаем дубликат, чтобы очистка не повредила другие элементы
+    content_copy = BeautifulSoup(str(content_div), "html.parser")
+
+    # Очищаем от скриптов, стилей и фреймов
+    for tag in content_copy.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # Скачиваем файлы-вложения из статьи
-    file_attachments = download_file_attachments(content_div, temp_dir)
+    # Скачиваем файлы-вложения из текста статьи
+    file_attachments = download_file_attachments(content_copy, temp_dir)
 
-    # Обрабатываем изображения внутри текста статьи
-    for img in content_div.find_all("img"):
+    # Обрабатываем картинки в самом тексте
+    for img in content_copy.find_all("img"):
         res = process_single_image(img, image_idx, temp_dir)
         if res:
             cid, path = res
             inline_images.append((cid, path))
             image_idx += 1
 
-    article_body_html = str(content_div)
+    article_body_html = str(content_copy)
 
     return title, main_img_html, article_body_html, inline_images, file_attachments
 
@@ -220,7 +224,7 @@ def get_article_data(entry, temp_dir):
     # Форматирование даты публикации в GMT+5
     pub_date_str = format_pub_date_gmt5(soup, fallback_date)
 
-    # Точный парсинг нужного блока статьи
+    # Точный парсинг
     title, main_img_html, body_html, inline_images, file_attachments = parse_article_exact_fields(soup, temp_dir)
 
     final_title = title if title else fallback_title
