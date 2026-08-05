@@ -138,7 +138,6 @@ def format_pub_date_gmt5(soup, fallback_date):
     if time_tag and time_tag.get("datetime"):
         dt_str = time_tag["datetime"]
         try:
-            # Парсим ISO-формат времени (например: 2026-08-05T09:53:17+02:00)
             dt = datetime.fromisoformat(dt_str)
             target_tz = timezone(timedelta(hours=5))
             dt_gmt5 = dt.astimezone(target_tz)
@@ -153,15 +152,15 @@ def format_pub_date_gmt5(soup, fallback_date):
 
 
 def parse_article_exact_fields(soup, temp_dir):
-    """Извлекает только необходимые блоки: заголовок, дата, главное фото, тело статьи."""
+    """Извлекает только требуемый блок статьи (<div class="tdb-block-inner td-fix-index">)."""
     inline_images = []
     image_idx = 0
 
-    # 1. Заголовок
+    # 1. Заголовок из <h1 class="tdb-title-text">
     h1_tag = soup.find("h1", class_="tdb-title-text") or soup.find("h1")
     title = h1_tag.get_text().strip() if h1_tag else ""
 
-    # 2. Главное фото
+    # 2. Главное фото из <img class="entry-thumb td-modal-image">
     main_img_html = ""
     featured_img = soup.find("img", class_="entry-thumb td-modal-image")
     if featured_img:
@@ -172,24 +171,30 @@ def parse_article_exact_fields(soup, temp_dir):
             main_img_html = f'<div style="margin: 15px 0;"><img src="cid:{cid}" style="max-width: 100%; height: auto; display: block; margin: 0 auto;"></div>'
             image_idx += 1
 
-    # 3. Контент статьи (только нужный блок)
-    content_div = (
-        soup.find("div", class_="tdb-block-inner td-fix-index") or 
-        soup.find("div", class_="entry-content") or 
-        soup.find("article")
-    )
+    # 3. Контент статьи: ищем блок tdb-block-inner td-fix-index, содержащий абзацы статьи
+    content_div = None
+    candidate_divs = soup.find_all("div", class_=lambda c: c and "tdb-block-inner" in c and "td-fix-index" in c)
+    
+    for div in candidate_divs:
+        if div.find("p"):  # Находим блок, внутри которого действительно есть текст параграфов
+            content_div = div
+            break
+
+    # Резервный поиск, если структура класса немного отличается
+    if not content_div:
+        content_div = soup.find("div", class_="entry-content") or soup.find("article")
     
     if not content_div:
         return title, main_img_html, "", [], []
 
-    # Удаляем скрипты и мусор из тела статьи
+    # Очищаем только от скриптов, стилей и фреймов
     for tag in content_div.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # Скачиваем вложения из текста статьи
+    # Скачиваем файлы-вложения из статьи
     file_attachments = download_file_attachments(content_div, temp_dir)
 
-    # Обрабатываем оставшиеся изображения внутри самой статьи
+    # Обрабатываем изображения внутри текста статьи
     for img in content_div.find_all("img"):
         res = process_single_image(img, image_idx, temp_dir)
         if res:
@@ -212,10 +217,10 @@ def get_article_data(entry, temp_dir):
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Получаем точную дату и конвертируем в GMT+5
+    # Форматирование даты публикации в GMT+5
     pub_date_str = format_pub_date_gmt5(soup, fallback_date)
 
-    # Парсим строго заголовок, главное фото и блок статьи
+    # Точный парсинг нужного блока статьи
     title, main_img_html, body_html, inline_images, file_attachments = parse_article_exact_fields(soup, temp_dir)
 
     final_title = title if title else fallback_title
@@ -232,7 +237,7 @@ def send_email(title, pub_date_str, main_img_html, body_html, inline_images, fil
     msg_alternative = MIMEMultipart("alternative")
     msg_root.attach(msg_alternative)
 
-    # Строгая верстка письма: Заголовок -> Дата (GMT+5) -> Титульное фото -> Текст статьи
+    # Верстка: Заголовок -> Дата (GMT+5) -> Титульное фото -> Текст статьи
     full_html = f"""
     <html>
       <head>
@@ -257,7 +262,7 @@ def send_email(title, pub_date_str, main_img_html, body_html, inline_images, fil
 
     msg_alternative.attach(MIMEText(full_html, "html", "utf-8"))
 
-    # Прикрепляем картинки (включая главную и те, что в теле статьи) через CID
+    # Прикрепляем изображения через CID
     for cid, img_path in inline_images:
         try:
             with open(img_path, "rb") as f:
@@ -268,7 +273,7 @@ def send_email(title, pub_date_str, main_img_html, body_html, inline_images, fil
         except Exception as e:
             print(f"[!] Ошибка прикрепления CID-картинки {cid}: {e}")
 
-    # Прикрепляем сторонние файлы-вложения
+    # Прикрепляем вложения
     for filepath in file_attachments:
         try:
             filename = os.path.basename(filepath)
