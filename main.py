@@ -138,56 +138,47 @@ def download_file_attachments(soup_content, temp_dir):
 
 
 def clean_article_body(soup_content):
-    """Удаляет мусорные блоки: Важное, Навигацию, Редакцию, Последние сообщения и т.д."""
-    # 1. Удаляем интерактивные теги
+    """Безопасная очистка статьи от мусорных блоков (важное, навигация, редакция)."""
+    # 1. Удаляем скрипты, стили, фреймы и рекламные элементы
     for tag in soup_content.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # 2. Удаление структурных блоков по классам/ID темы сайта
+    # 2. Удаление блоков только по ТОЧНЫМ CSS-селекторам навигации и сайдбаров
     unwanted_selectors = [
-        # Стандартные блоки сайдбара и футера статьи
         ".recent-posts", ".related-posts", ".popular-posts", ".yarpp-related",
         ".widget", ".post-publisher", ".entry-meta", ".post-meta", ".share-buttons",
         ".tags-links", ".cat-links", ".comments-area", "#comments", "#respond",
         ".nav-links", ".post-navigation", ".navigation", ".nav-previous", ".nav-next",
-        ".post-links", ".post-footer", ".sidebar", "#sidebar", ".editorial-contact",
-        ".important-posts", ".featured-posts", ".sticky-posts", ".more-posts"
+        ".post-links", ".post-footer", ".editorial-contact", ".sidebar", "#sidebar"
     ]
     for selector in unwanted_selectors:
         for element in soup_content.select(selector):
             element.decompose()
 
-    # 3. Точечное удаление блоков по ключевым словам и заголовкам
-    phrases_to_remove = [
-        "важное", 
-        "предыдущая статья", 
-        "следующая статья", 
-        "написать в редакцию", 
-        "последние сообщения", 
-        "последние события",
-        "больше по теме", 
-        "читайте также", 
-        "похожие новости", 
-        "рекомендуем",
-        "обратная связь",
-        "связаться с нами"
+    # 3. Безопасное удаление заголовков и навигационных ссылок с ключевыми словами
+    phrases = [
+        "важное", "предыдущая статья", "следующая статья", 
+        "написать в редакцию", "последние сообщения", "последние события", 
+        "больше по теме", "читайте также", "похожие новости", "рекомендуем"
     ]
 
-    for element in soup_content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "a"]):
-        text = element.get_text().strip().lower()
-        if any(phrase in text for phrase in phrases_to_remove):
-            # Если это ссылка или параграф с фразой вроде "Предыдущая статья", удаляем элемент целиком
-            if element.name in ["a", "p", "div", "span"]:
-                # Если элемент является заголовком или контейнером блока, проверяем его соседей
-                next_elem = element.find_next_sibling()
-                if next_elem and next_elem.name in ["ul", "ol", "div", "p"]:
-                    next_elem.decompose()
-                element.decompose()
-            elif element.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-                next_elem = element.find_next_sibling()
-                if next_elem and next_elem.name in ["ul", "ol", "div", "p"]:
-                    next_elem.decompose()
-                element.decompose()
+    # Удаляем только конкретные элементы (ссылки или мелкие заголовки), не затрагивая контейнеры
+    for elem in soup_content.find_all(["h2", "h3", "h4", "h5", "h6", "a", "span", "p"]):
+        # Не удаляем главный контейнер или большие блоки
+        if elem.name in ["div", "article", "body", "html"]:
+            continue
+
+        text = elem.get_text().strip().lower()
+        if any(phrase in text for phrase in phrases):
+            # Если это заголовок блока (например <h3>Важное</h3>), удаляем его и следующий список/блок
+            if elem.name in ["h2", "h3", "h4", "h5", "h6"]:
+                next_sibling = elem.find_next_sibling()
+                if next_sibling and next_sibling.name in ["ul", "ol", "div"]:
+                    next_sibling.decompose()
+                elem.decompose()
+            # Если это ссылка навигации («Предыдущая статья»), удаляем только саму ссылку
+            elif elem.name in ["a", "span"]:
+                elem.decompose()
 
     return str(soup_content)
 
@@ -202,7 +193,7 @@ def get_article_data(entry, temp_dir):
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Основной контейнер статьи
+    # Находим блок с контентом
     content_div = soup.find("div", class_="entry-content") or soup.find("article")
     if not content_div:
         return None, [], [], title, pub_date
@@ -213,7 +204,7 @@ def get_article_data(entry, temp_dir):
     # 2. Скачиваем все фото на Runner, оптимизируем и подменяем на CID
     inline_images = process_and_download_images(content_div, temp_dir)
 
-    # 3. Полностью чистим HTML статьи от навигации и мусорных блоков
+    # 3. Безопасно чистим HTML статьи
     cleaned_html = clean_article_body(content_div)
 
     return cleaned_html, inline_images, file_attachments, title, pub_date
@@ -251,7 +242,7 @@ def send_email(html_body, inline_images, file_attachments, article_title, pub_da
 
     msg_alternative.attach(MIMEText(full_html, "html", "utf-8"))
 
-    # Прикрепляем картинки тела через CID
+    # Прикрепляем оптимизированные изображения через CID
     for cid, img_path in inline_images:
         try:
             with open(img_path, "rb") as f:
