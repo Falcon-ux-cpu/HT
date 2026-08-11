@@ -132,8 +132,8 @@ def download_file_attachments(soup_content, temp_dir):
 
 
 def format_pub_date_gmt5(soup, fallback_date):
-    """Извлекает время из тега <time>, конвертирует его в GMT+5 и форматирует строку."""
-    time_tag = soup.find("time", class_="entry-date") or soup.find("time")
+    """Строго ищет <time class="entry-date updated td-module-date">, берет datetime и переводит в GMT+5."""
+    time_tag = soup.find("time", class_=lambda c: c and "entry-date" in c)
     
     if time_tag and time_tag.get("datetime"):
         dt_str = time_tag["datetime"]
@@ -143,16 +143,18 @@ def format_pub_date_gmt5(soup, fallback_date):
             dt_gmt5 = dt.astimezone(target_tz)
             return dt_gmt5.strftime("%d.%m.%Y, %H:%M (GMT+5)")
         except Exception as e:
-            print(f"[!] Не удалось распарсить дату {dt_str}: {e}")
+            print(f"[!] Не удалось распарсить ISO дату {dt_str}: {e}")
 
-    if time_tag and time_tag.get_text().strip():
-        return f"{time_tag.get_text().strip()} (GMT+5)"
+    if time_tag:
+        text_val = time_tag.get_text().strip()
+        if text_val:
+            return f"{text_val} (GMT+5)"
 
     return f"{fallback_date} (GMT+5)" if fallback_date else ""
 
 
 def parse_article_exact_fields(soup, temp_dir):
-    """Точный извлекатель: заголовок, главная картинка и гарантированное тело статьи."""
+    """Точный извлекатель по указанной структуре элемента."""
     inline_images = []
     image_idx = 0
 
@@ -171,34 +173,28 @@ def parse_article_exact_fields(soup, temp_dir):
             main_img_html = f'<div style="margin: 15px 0;"><img src="cid:{cid}" style="max-width: 100%; height: auto; display: block; margin: 0 auto;"></div>'
             image_idx += 1
 
-    # 3. Контент статьи: находим параграфы статьи wp-block-paragraph и берем их родительский блок
+    # 3. Контент статьи: ищем родительский контейнер параграфов wp-block-paragraph
     content_div = None
     paragraphs = soup.find_all("p", class_="wp-block-paragraph")
     
     if paragraphs:
-        # Находим контейнер, который объединяет эти параграфы
         content_div = paragraphs[0].find_parent("div", class_=lambda c: c and "tdb-block-inner" in c)
         if not content_div:
             content_div = paragraphs[0].parent
 
-    # Резервный поиск, если структура статей изменится
     if not content_div:
         content_div = soup.find("div", class_="entry-content") or soup.find("article")
     
     if not content_div:
         return title, main_img_html, "", [], []
 
-    # Создаем дубликат, чтобы очистка не повредила другие элементы
     content_copy = BeautifulSoup(str(content_div), "html.parser")
 
-    # Очищаем от скриптов, стилей и фреймов
     for tag in content_copy.find_all(["script", "style", "iframe", "ins", "form", "button"]):
         tag.decompose()
 
-    # Скачиваем файлы-вложения из текста статьи
     file_attachments = download_file_attachments(content_copy, temp_dir)
 
-    # Обрабатываем картинки в самом тексте
     for img in content_copy.find_all("img"):
         res = process_single_image(img, image_idx, temp_dir)
         if res:
@@ -221,10 +217,10 @@ def get_article_data(entry, temp_dir):
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Форматирование даты публикации в GMT+5
+    # Точный поиск даты публикации из структуры
     pub_date_str = format_pub_date_gmt5(soup, fallback_date)
 
-    # Точный парсинг
+    # Точный парсинг статьи
     title, main_img_html, body_html, inline_images, file_attachments = parse_article_exact_fields(soup, temp_dir)
 
     final_title = title if title else fallback_title
@@ -266,7 +262,6 @@ def send_email(title, pub_date_str, main_img_html, body_html, inline_images, fil
 
     msg_alternative.attach(MIMEText(full_html, "html", "utf-8"))
 
-    # Прикрепляем изображения через CID
     for cid, img_path in inline_images:
         try:
             with open(img_path, "rb") as f:
@@ -277,7 +272,6 @@ def send_email(title, pub_date_str, main_img_html, body_html, inline_images, fil
         except Exception as e:
             print(f"[!] Ошибка прикрепления CID-картинки {cid}: {e}")
 
-    # Прикрепляем вложения
     for filepath in file_attachments:
         try:
             filename = os.path.basename(filepath)
